@@ -43,7 +43,12 @@ from .vovnet import *
 from .xception import *
 from .xception_aligned import *
 from .twins import *
-from .resnet50_ft_dag import *
+from .resnet50_vgg import *
+from .cnn_vit import *
+from .cnn_frame_avg import *
+from .cnn_embedding_avg import *
+from .cnn_self_attention import *
+from .cnn_self_attention_sum import *
 
 from .factory import create_model, split_model_name, safe_model_name
 from .helpers import load_checkpoint, resume_checkpoint, model_parameters

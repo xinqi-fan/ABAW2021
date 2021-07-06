@@ -12,38 +12,50 @@ from torchvision import datasets
 
 class AffWild2EXPRDataset(dataset.Dataset):
 
-    def __init__(self, root_dir, phase, transform=None, generate_label=False):
+    def __init__(self, root_dir, img_relative_dir, label_relative_dir, data_mode='', phase='', transform=None, sequence_len=9, generate_label=False):
         self.root_dir = root_dir
-        self.img_dir = os.path.join(root_dir, 'Cropped_aligned_image/cropped_aligned')
         self.transform = transform
+        self.data_mode = data_mode
 
         self.EMOTIONS = {0: "Neutral", 1: "Anger", 2: "Disgust", 3: "Fear", 4: "Happiness", 5: "Sadness", 6: "Surprise"}
         self.EMOTIONS2Index = {"Neutral": 0, "Anger": 1, "Disgust": 2, "Fear": 3, "Happiness": 4, "Sadness": 5, "Surprise": 6}
 
+        self.img_relative_dir = img_relative_dir
+        self.img_dir = os.path.join(root_dir, self.img_relative_dir)
+        self.label_relative_dir = label_relative_dir
+
+        self.seq_len = sequence_len
+        self.seq_mid_len = round(self.seq_len // 2)
+
         if generate_label:
             if phase == 'train':
-                label_relative_dir = 'Annotation/annotations/EXPR_Set/Train_Set'
-                label_path = os.path.join(root_dir, label_relative_dir)
+                set_relative_dir = os.path.join(self.label_relative_dir, 'EXPR_Set/Train_Set')
+                label_path = os.path.join(root_dir, set_relative_dir)
                 self._gen_label(self.img_dir, label_path)
             elif phase == 'validation':
-                label_relative_dir_FER = 'Annotation/annotations/EXPR_Set/Validation_Set'
-                label_path = os.path.join(root_dir, label_relative_dir_FER)
+                set_relative_dir = os.path.join(self.label_relative_dir, 'EXPR_Set/Validation_Set')
+                label_path = os.path.join(root_dir, set_relative_dir)
                 self._gen_label(self.img_dir, label_path)
             else: # test
                 raise NotImplemented('Test set not implemented yet')
 
         if phase == 'train':
-            anno_relative_path = 'Annotation/annotations/EXPR_Set/Train_Set.csv'
-            anno_path = os.path.join(root_dir, anno_relative_path)
-            self.label_frame = pd.read_csv(anno_path, sep=',', header=0)
-            # self.label_frame = pd.read_csv(anno_path, sep=',', header=0).iloc[:1000]    # for debug
+            set_relative_dir = os.path.join(self.label_relative_dir, 'EXPR_Set/Train_Set.csv')
+            label_path = os.path.join(root_dir, set_relative_dir)
+            self.label_frame = pd.read_csv(label_path, sep=',', header=0)
+            # self.label_frame = pd.read_csv(label_path, sep=',', header=0).iloc[:1000]    # for debug
         elif phase == 'validation':
-            anno_relative_path = 'Annotation/annotations/EXPR_Set/Validation_Set.csv'
-            anno_path = os.path.join(root_dir, anno_relative_path)
-            self.label_frame = pd.read_csv(anno_path, sep=',', header=0)
-            # self.label_frame = pd.read_csv(anno_path, sep=',', header=0).iloc[:1000]    # for debug
+            set_relative_dir = os.path.join(self.label_relative_dir, 'EXPR_Set/Validation_Set.csv')
+            label_path = os.path.join(root_dir, set_relative_dir)
+            self.label_frame = pd.read_csv(label_path, sep=',', header=0)
+            # self.label_frame = pd.read_csv(label_path, sep=',', header=0).iloc[:1000]    # for debug
         else: # test
             raise NotImplemented('Test set not implemented yet')
+
+        # split video and image names
+        # self.label_frame = self.label_frame.reset_index(drop=True)          # for debug
+        video_with_img = self.label_frame.iloc[:, 0]
+        self.video_img = video_with_img.str.split('/', expand=True)
 
     def __len__(self):
         return len(self.label_frame)
@@ -51,18 +63,170 @@ class AffWild2EXPRDataset(dataset.Dataset):
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
-        img_name = os.path.join(self.img_dir, self.label_frame.iloc[idx, 0])
-        image = Image.open(img_name)
-        if self.transform:
-            image = self.transform(image)
 
+        if self.data_mode == 'static':
+            img_name = os.path.join(self.img_dir, self.label_frame.iloc[idx, 0])
+            image = Image.open(img_name)
+            if self.transform:
+                image = self.transform(image)
+
+        elif self.data_mode == 'sequence_naive':
+            # image sequence index
+            if idx - self.seq_mid_len < 0:
+                idx_seq = list(range(idx, idx + self.seq_len))
+            elif idx + self.seq_mid_len + 1 > len(self.label_frame):
+                idx_seq = list(range(idx - self.seq_len + 1, idx + 1))
+            else:
+                idx_seq = list(range(idx - self.seq_mid_len, idx + self.seq_mid_len + 1))
+
+            # image sequence
+            img_seq = []
+            img_name_seq = []
+            for idx_cur in idx_seq:
+                img_name = os.path.join(self.img_dir, self.label_frame.iloc[idx_cur, 0])
+                img = Image.open(img_name)
+                if self.transform:
+                    img = self.transform(img)
+                img_seq.append(img)
+                img_name_seq.append(img_name)
+            image = torch.stack(img_seq, dim=0)
+
+        elif self.data_mode == 'sequence_video_middle':
+            # video by video data loading
+            cur_video_name = self.video_img.iloc[idx, 0]
+            video_indices = self.video_img.index[self.video_img.iloc[:, 0] == cur_video_name].to_list()
+            video_len = len(video_indices)
+            start_idx, end_idx = video_indices[0], video_indices[-1]
+            dist_to_start = idx - start_idx
+            dist_to_end = end_idx - idx
+
+            if video_len < self.seq_len:
+                idx_seq = list(range(start_idx, end_idx+1))
+                n_more_frame = self.seq_len - video_len
+                for _ in range(n_more_frame):
+                    idx_seq.append(idx)         # repeat current frame
+                idx_seq.sort()
+            else:
+                # fix idx in the middle
+                if dist_to_start < self.seq_mid_len:
+                    idx_seq = list(range(idx - dist_to_start, idx + self.seq_mid_len + 1))
+                    repeat = [idx - dist_to_start] * (self.seq_mid_len - dist_to_start)
+                    idx_seq.extend(repeat)
+                    idx_seq = sorted(idx_seq)
+                elif dist_to_end < self.seq_mid_len:
+                    idx_seq = list(range(idx - self.seq_mid_len, idx + dist_to_end + 1))
+                    repeat = [idx + dist_to_end] * (self.seq_mid_len - dist_to_end)
+                    idx_seq.extend(repeat)
+                    idx_seq = sorted(idx_seq)
+                else:
+                    idx_seq = list(range(idx - self.seq_mid_len, idx + self.seq_mid_len + 1))
+            assert len(idx_seq) == self.seq_len
+
+            # image sequence
+            img_seq = []
+            img_path_seq = []
+            for idx_cur in idx_seq:
+                img_path = os.path.join(self.img_dir, self.label_frame.iloc[idx_cur, 0])
+                img = Image.open(img_path)
+                if self.transform:
+                    img = self.transform(img)
+                img_seq.append(img)
+                img_path_seq.append(img_path)
+            image = torch.stack(img_seq, dim=0)
+
+        elif self.data_mode == 'sequence_video_middle_repeat':
+            # video by video data loading
+            cur_video_name = self.video_img.iloc[idx, 0]
+            video_indices = self.video_img.index[self.video_img.iloc[:, 0] == cur_video_name].to_list()
+            video_len = len(video_indices)
+            start_idx, end_idx = video_indices[0], video_indices[-1]
+            dist_to_start = idx - start_idx
+            dist_to_end = end_idx - idx
+
+            if video_len < self.seq_len:
+                idx_seq = list(range(start_idx, end_idx+1))
+                n_more_frame = self.seq_len - video_len
+                for _ in range(n_more_frame):
+                    idx_seq.append(idx)         # repeat current frame
+                idx_seq.sort()
+            else:
+                # fix idx in the middle
+                if dist_to_start < self.seq_mid_len:
+                    idx_seq = list(range(idx - dist_to_start, idx + self.seq_mid_len + 1))
+                    repeat = [idx] * (self.seq_mid_len - dist_to_start)
+                    idx_seq.extend(repeat)
+                    idx_seq = sorted(idx_seq)
+
+                elif dist_to_end < self.seq_mid_len:
+                    idx_seq = list(range(idx - self.seq_mid_len, idx + dist_to_end + 1))
+                    repeat = [idx] * (self.seq_mid_len - dist_to_end)
+                    idx_seq.extend(repeat)
+                    idx_seq = sorted(idx_seq)
+                else:
+                    idx_seq = list(range(idx - self.seq_mid_len, idx + self.seq_mid_len + 1))
+            assert len(idx_seq) == self.seq_len
+
+            # image sequence
+            img_seq = []
+            img_path_seq = []
+            for idx_cur in idx_seq:
+                img_path = os.path.join(self.img_dir, self.label_frame.iloc[idx_cur, 0])
+                img = Image.open(img_path)
+                if self.transform:
+                    img = self.transform(img)
+                img_seq.append(img)
+                img_path_seq.append(img_path)
+            image = torch.stack(img_seq, dim=0)
+
+        elif self.data_mode == 'sequence_video_non_middle':
+            # video by video data loading
+            cur_video_name = self.video_img.iloc[idx, 0]
+            video_indices = self.video_img.index[self.video_img.iloc[:, 0] == cur_video_name].to_list()
+            video_len = len(video_indices)
+            start_idx, end_idx = video_indices[0], video_indices[-1]
+            dist_to_start = idx - start_idx
+            dist_to_end = end_idx - idx
+
+            if video_len < self.seq_len:
+                idx_seq = list(range(start_idx, end_idx + 1))
+                n_more_frame = self.seq_len - video_len
+                for _ in range(n_more_frame):
+                    idx_seq.append(idx)  # repeat current frame
+                idx_seq.sort()
+            else:
+                # not fix idx in the middle
+                if dist_to_start < self.seq_mid_len:
+                    last_frame_idx = idx + self.seq_mid_len + (self.seq_mid_len - dist_to_start)
+                    idx_seq = list(range(last_frame_idx-self.seq_len+1, last_frame_idx+1))
+                elif dist_to_end < self.seq_mid_len:
+                    first_frame_idx = idx - self.seq_mid_len - (self.seq_mid_len - dist_to_end)
+                    idx_seq = list(range(first_frame_idx, first_frame_idx+self.seq_len))
+                else:
+                    idx_seq = list(range(idx - self.seq_mid_len, idx + self.seq_mid_len + 1))
+            assert len(idx_seq) == self.seq_len
+
+            # image sequence
+            img_seq = []
+            img_path_seq = []
+            for idx_cur in idx_seq:
+                img_path = os.path.join(self.img_dir, self.label_frame.iloc[idx_cur, 0])
+                img = Image.open(img_path)
+                if self.transform:
+                    img = self.transform(img)
+                img_seq.append(img)
+                img_path_seq.append(img_path)
+            image = torch.stack(img_seq, dim=0)
+
+        else:
+            raise ValueError('data mode not supported: {}'.format(self.data_mode))
+
+        # label
         labels = self.label_frame.iloc[idx, 1].astype('float')
         labels = torch.tensor(labels).long()
 
         return image, labels
 
     def _gen_label(self, img_dir, label_dir):
-
         label_frame = np.zeros((0, 2))
         video_dir = os.listdir(label_dir)
 
@@ -81,163 +245,6 @@ class AffWild2EXPRDataset(dataset.Dataset):
         label_framw_save_path = os.path.join(label_task_dir, set_flag+'.csv')
         label_frame.to_csv(label_framw_save_path, index=False)
         print(f'label saved to {label_framw_save_path}')
-
-
-class AffWild2SeqEXPRDataset(dataset.Dataset):
-
-    def __init__(self, root_dir, phase, transform=None):
-        self.root_dir = root_dir
-        self.img_dir = os.path.join(root_dir, 'Cropped_aligned_image/cropped_aligned')
-        self.transform = transform
-
-        self.seq_len = 9
-        self.seq_mid = round(self.seq_len // 2)
-
-        self.EMOTIONS = {0: "Neutral", 1: "Anger", 2: "Disgust", 3: "Fear", 4: "Happiness", 5: "Sadness", 6: "Surprise"}
-        self.EMOTIONS2Index = {"Neutral": 0, "Anger": 1, "Disgust": 2, "Fear": 3, "Happiness": 4, "Sadness": 5, "Surprise": 6}
-
-        if phase == 'train':
-            anno_relative_path = 'Annotation/annotations/EXPR_Set/Train_Set.csv'
-            anno_path = os.path.join(root_dir, anno_relative_path)
-            self.label_frame = pd.read_csv(anno_path, sep=',', header=0)
-            # self.label_frame = pd.read_csv(anno_path, sep=',', header=0).iloc[-1235:]    # for debug
-        elif phase == 'validation':
-            anno_relative_path = 'Annotation/annotations/EXPR_Set/Validation_Set.csv'
-            anno_path = os.path.join(root_dir, anno_relative_path)
-            self.label_frame = pd.read_csv(anno_path, sep=',', header=0)
-            # self.label_frame = pd.read_csv(anno_path, sep=',', header=0).iloc[-1239:]    # for debug
-        else: # testdata
-            raise NotImplemented('Test set not implemented yet')
-
-    def __len__(self):
-        return len(self.label_frame)
-
-    def __getitem__(self, idx):
-        if torch.is_tensor(idx):
-            idx = idx.tolist()
-
-        # image sequence index
-        if idx-self.seq_mid < 0:
-            idx_seq = list(range(idx, idx+self.seq_len))
-        elif idx+self.seq_mid+1 > len(self.label_frame):
-            idx_seq = list(range(idx-self.seq_len+1, idx+1))
-        else:
-            idx_seq = list(range(idx-self.seq_mid, idx+self.seq_mid+1))
-
-        # image sequence
-        img_seq = []
-        img_name_seq = []
-        for idx_cur in idx_seq:
-            img_name = os.path.join(self.img_dir, self.label_frame.iloc[idx_cur, 0])
-            img = Image.open(img_name)
-            if self.transform:
-                img = self.transform(img)
-            img_seq.append(img)
-            img_name_seq.append(img_name)
-
-        # label
-        labels = self.label_frame.iloc[idx, 1].astype('float')
-        labels = torch.tensor(labels).long()
-
-        return img_seq, labels, img_name_seq
-
-
-class AffWild2SeqByVideoEXPRDataset(dataset.Dataset):
-
-    def __init__(self, root_dir, phase, transform=None, sequence_len=9):
-        self.root_dir = root_dir
-        self.img_dir = os.path.join(root_dir, 'Cropped_aligned_image/cropped_aligned')
-        self.transform = transform
-
-        self.seq_len = sequence_len
-        self.seq_mid_len = round(self.seq_len // 2)
-
-        self.EMOTIONS = {0: "Neutral", 1: "Anger", 2: "Disgust", 3: "Fear", 4: "Happiness", 5: "Sadness", 6: "Surprise"}
-        self.EMOTIONS2Index = {"Neutral": 0, "Anger": 1, "Disgust": 2, "Fear": 3, "Happiness": 4, "Sadness": 5, "Surprise": 6}
-
-        if phase == 'train':
-            anno_relative_path = 'Annotation/annotations/EXPR_Set/Train_Set.csv'
-            anno_path = os.path.join(root_dir, anno_relative_path)
-            self.label_frame = pd.read_csv(anno_path, sep=',', header=0)
-            # self.label_frame = pd.read_csv(anno_path, sep=',', header=0).iloc[-1000:]    # for debug
-        elif phase == 'validation':
-            anno_relative_path = 'Annotation/annotations/EXPR_Set/Validation_Set.csv'
-            anno_path = os.path.join(root_dir, anno_relative_path)
-            self.label_frame = pd.read_csv(anno_path, sep=',', header=0)
-            # self.label_frame = pd.read_csv(anno_path, sep=',', header=0).iloc[-1000:]    # for debug
-        else: # testdata
-            raise NotImplemented('Test set not implemented yet')
-
-        # split video and image names
-        self.label_frame = self.label_frame.reset_index(drop=True)          # for debug
-        video_with_img = self.label_frame.iloc[:, 0]
-        self.video_img = video_with_img.str.split('/', expand=True)
-
-    def __len__(self):
-        return len(self.label_frame)
-
-    def __getitem__(self, idx):
-        if torch.is_tensor(idx):
-            idx = idx.tolist()
-
-        # video by video data loading
-        cur_video_name = self.video_img.iloc[idx, 0]
-        video_indices = self.video_img.index[self.video_img.iloc[:, 0] == cur_video_name].to_list()
-        video_len = len(video_indices)
-        start_idx, end_idx = video_indices[0], video_indices[-1]
-        dist_to_start = idx - start_idx
-        dist_to_end = end_idx - idx
-
-        # pad some short cases
-        if video_len < self.seq_len:
-            idx_seq = list(range(start_idx, end_idx+1))
-            n_more_frame = self.seq_len - video_len
-            for _ in range(n_more_frame):
-                idx_seq.append(idx)         # repeat current frame
-            idx_seq.sort()
-        else:
-            # not fix idx in the middle
-            # if dist_to_start < self.seq_mid_len:
-            #     last_frame_idx = idx + self.seq_mid_len + (self.seq_mid_len - dist_to_start)
-            #     idx_seq = list(range(last_frame_idx-self.seq_len+1, last_frame_idx+1))
-            # elif dist_to_end < self.seq_mid_len:
-            #     first_frame_idx = idx - self.seq_mid_len - (self.seq_mid_len - dist_to_end)
-            #     idx_seq = list(range(first_frame_idx, first_frame_idx+self.seq_len))
-            # else:
-            #     idx_seq = list(range(idx - self.seq_mid_len, idx + self.seq_mid_len + 1))
-
-            # fix idx in the middle
-            if dist_to_start < self.seq_mid_len:
-                idx_seq = list(range(idx - dist_to_start, idx + self.seq_mid_len + 1))
-                repeat = [idx - dist_to_start] * (self.seq_mid_len - dist_to_start)
-                idx_seq.extend(repeat)
-                idx_seq = sorted(idx_seq)
-            elif dist_to_end < self.seq_mid_len:
-                idx_seq = list(range(idx - self.seq_mid_len, idx + dist_to_end + 1))
-                repeat = [idx + dist_to_end] * (self.seq_mid_len - dist_to_end)
-                idx_seq.extend(repeat)
-                idx_seq = sorted(idx_seq)
-            else:
-                idx_seq = list(range(idx - self.seq_mid_len, idx + self.seq_mid_len + 1))
-
-        assert len(idx_seq) == self.seq_len
-
-        # image sequence
-        img_seq = []
-        img_path_seq = []
-        for idx_cur in idx_seq:
-            img_path = os.path.join(self.img_dir, self.label_frame.iloc[idx_cur, 0])
-            img = Image.open(img_path)
-            if self.transform:
-                img = self.transform(img)
-            img_seq.append(img)
-            img_path_seq.append(img_path)
-
-        # label
-        labels = self.label_frame.iloc[idx, 1].astype('float')
-        labels = torch.tensor(labels).long()
-
-        return img_seq, labels, img_path_seq
 
 
 class AffWild2AUDataset(dataset.Dataset):

@@ -4,17 +4,16 @@ import os
 import sys
 import argparse
 import time
-import math
 import numpy as np
 
 import torch
 import torch.backends.cudnn as cudnn
 from torchvision import transforms
-from torch.nn.parallel import DistributedDataParallel as DDP
 
-from data import AffWild2EXPRDataset, AffWild2SeqEXPRDataset, AffWild2SeqByVideoEXPRDataset, frames_collate
-from models.cnn_vit import CNN_ViT
+from data import AffWild2EXPRDataset
+from models import Resnet50Vgg, CnnVit, CnnFrameAvg, CnnEmbedAvg, CnnSelfAtt, CnnSelfAttSum
 from utils import AverageMeter, accuracy, EXPR_metric
+from utils import Logger
 
 # try:
 #     import apex
@@ -54,11 +53,16 @@ def parse_arguments():
                         help='using learning rate scheduler')
 
     # model dataset
-    parser.add_argument('--model', type=str, default='ResNet50VGG-ViT')
+    parser.add_argument('--model', type=str, default='Resnet50Vgg',
+                        choices=['Resnet50Vgg', 'CnnVit', 'CnnFrameAvg', 'CnnEmbedAvg', 'CnnSelfAtt', 'CnnSelfAttSum'])
     parser.add_argument('--dataset', type=str, default='Aff-Wild2',
                         choices=['Aff-Wild2', 'RAF-DB'], help='dataset')
     parser.add_argument('--data_folder', type=str, default='/home/xinqifan2/Data/Facial_Expression/Aff-Wild2/ABAW-2021', help='path to custom dataset')
+    parser.add_argument('--img_relative_folder', type=str, default='Cropped_aligned_image/cropped_aligned', help='path to relative image folder')
+    parser.add_argument('--label_relative_folder', type=str, default='Annotation/annotations', help='path to relative label folder')
     parser.add_argument('--task', type=str, default='EXPR')
+    parser.add_argument('--data_mode', type=str, default='static',
+                        choices=['static', 'sequence_naive', 'sequence_video_middle', 'sequence_video_middle_repeat', 'sequence_video_non_middle'])
 
     # other setting
     parser.add_argument('--cnn_ckpt', type=str, default='weights/resnet50_ft_dag.pth',
@@ -71,17 +75,25 @@ def parse_arguments():
                         help='number of frames used at each time stamp (sequence length = number of batches)')
     parser.add_argument('--save_model', action='store_true',
                         help='save model')
+    parser.add_argument('--hpc', action='store_true', help='whether train on hpc')
 
     args = parser.parse_args()
 
     args.model_path = './save/{}_models'.format(args.dataset)
-    args.model_name = '{}_{}_{}_lr_{}_bsz_{}'.\
-        format(args.dataset, args.task, args.model, args.learning_rate, args.batch_size)
-    print(f'model name: {args.model_name}')
+    args.model_name = '{}_{}_{}_{}_lr_{}_bsz_{}'.\
+        format(args.dataset, args.data_mode, args.task, args.model, args.learning_rate, args.batch_size)
 
     args.save_folder = os.path.join(args.model_path, args.model_name)
     if not os.path.isdir(args.save_folder):
         os.makedirs(args.save_folder)
+
+    if not args.hpc:
+        log_file = os.path.join(args.save_folder, 'output_log.txt')
+        sys.stdout = Logger(filename=log_file)
+        sys.stderr = sys.stdout
+
+    print(f'model name: {args.model_name}')
+    print(f'args: {args}')
 
     if args.dataset == 'Aff-Wild2':
         args.n_cls = 7
@@ -115,11 +127,9 @@ def set_loader(args):
     ])
 
     if args.dataset == 'Aff-Wild2':
-        # train_dataset = AffWild2SeqByVideoEXPRDataset(args.data_folder, phase='train', transform=train_transform)
-        train_dataset = AffWild2SeqByVideoEXPRDataset(args.data_folder, phase='train', transform=train_transform, sequence_len=args.num_patch)
+        train_dataset = AffWild2EXPRDataset(args.data_folder, args.img_relative_folder, args.label_relative_folder, data_mode=args.data_mode, phase='train', transform=train_transform, sequence_len=args.num_patch)
+        val_dataset = AffWild2EXPRDataset(args.data_folder, args.img_relative_folder, args.label_relative_folder, data_mode=args.data_mode, phase='validation', transform=val_transform, sequence_len=args.num_patch)
         print('Train set size:', train_dataset.__len__())
-        # val_dataset = AffWild2SeqByVideoEXPRDataset(args.data_folder, phase='validation', transform=val_transform)
-        val_dataset = AffWild2SeqByVideoEXPRDataset(args.data_folder, phase='validation', transform=val_transform, sequence_len=args.num_patch)
         print('Validation set size:', val_dataset.__len__())
         # train_sampler = weighted_sampler_generator(data_txt_dir, args.dataset)
         train_sampler = None
@@ -128,17 +138,31 @@ def set_loader(args):
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.num_workers, pin_memory=True, sampler=train_sampler, collate_fn=frames_collate)
+        num_workers=args.num_workers, pin_memory=True, sampler=train_sampler)
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True, collate_fn=frames_collate)
+        num_workers=args.num_workers, pin_memory=True)
 
     return train_loader, val_loader
 
 
 def set_model(args):
 
-    model = CNN_ViT(num_patch=args.num_patch, embed_dim=args.embed_dim, output_dim=args.n_cls, cnn_ckpt=args.cnn_ckpt, vit_ckpt=args.vit_ckpt)
+    if args.model == 'Resnet50Vgg':
+        model = Resnet50Vgg(output_dim=args.n_cls, ckpt=args.cnn_ckpt)
+    elif args.model == 'CnnVit':
+        model = CnnVit(num_patch=args.num_patch, embed_dim=args.embed_dim, output_dim=args.n_cls, cnn_ckpt=args.cnn_ckpt, vit_ckpt=args.vit_ckpt)
+    elif args.model == 'CnnFrameAvg':
+        model = CnnFrameAvg(num_patch=args.num_patch, embed_dim=args.embed_dim, output_dim=args.n_cls, cnn_ckpt=args.cnn_ckpt)
+    elif args.model == 'CnnEmbedAvg':
+        model = CnnEmbedAvg(num_patch=args.num_patch, embed_dim=args.embed_dim, output_dim=args.n_cls, cnn_ckpt=args.cnn_ckpt)
+    elif args.model == 'CnnSelfAtt':
+        model = CnnSelfAtt(num_patch=args.num_patch, embed_dim=args.embed_dim, output_dim=args.n_cls, num_heads=4, dropout=0.2, cnn_ckpt=args.cnn_ckpt)
+    elif args.model == 'CnnSelfAttSum':
+        model = CnnSelfAttSum(num_patch=args.num_patch, embed_dim=args.embed_dim, output_dim=args.n_cls, num_heads=4, dropout=0.2, cnn_ckpt=args.cnn_ckpt)
+    else:
+        raise ValueError('model not supported: {}'.format(args.model))
+
     print(model)
     # check requires grad
     # for name, param in model.named_parameters():
@@ -156,26 +180,26 @@ def set_model(args):
     return model, criterion
 
 
-def set_optimizer(opt, model):
+def set_optimizer(args, model):
 
-    if opt.optimizer == 'sgd':
+    if args.optimizer == 'sgd':
         optimizer = torch.optim.SGD(model.parameters(),
-                              lr=opt.learning_rate,
-                              momentum=opt.momentum,
-                              weight_decay=opt.weight_decay)
-    elif opt.optimizer == 'adam':
+                              lr=args.learning_rate,
+                              momentum=args.momentum,
+                              weight_decay=args.weight_decay)
+    elif args.optimizer == 'adam':
         optimizer = torch.optim.Adam(model.parameters(),
-                               lr=opt.learning_rate,
-                               weight_decay=opt.weight_decay)
+                               lr=args.learning_rate,
+                               weight_decay=args.weight_decay)
     else:
-        raise ValueError('optimizer not supported: {}'.format(opt.optimizer))
+        raise ValueError('optimizer not supported: {}'.format(args.optimizer))
     return optimizer
 
 
-def save_model(model, optimizer, opt, epoch, save_file):
+def save_model(model, optimizer, args, epoch, save_file):
     print('==> Saving...')
     state = {
-        'opt': opt,
+        'args': args,
         'model': model.state_dict(),
         'optimizer': optimizer.state_dict(),
         'epoch': epoch,
@@ -190,11 +214,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
-    top1 = AverageMeter()
+    acc = AverageMeter()
     label = {'gt': [], 'pred': []}
 
     end = time.time()
-    for idx, (images, targets, _) in enumerate(train_loader):
+    for idx, (images, targets) in enumerate(train_loader):
         data_time.update(time.time() - end)
 
         images = images.cuda()
@@ -208,8 +232,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         # update metric
         losses.update(loss, bsz)
-        acc1= accuracy(output, targets)
-        top1.update(acc1[0], bsz)
+        acc_batch = accuracy(output, targets)
+        acc.update(acc_batch[0], bsz)
         label['gt'].append(targets.cpu().detach().numpy())
         label['pred'].append(output.cpu().detach().numpy())
 
@@ -227,9 +251,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
                   'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
                   'loss {loss.val:.3f} ({loss.avg:.3f})\t'
-                  'Acc@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+                  'Acc@ {acc.val:.3f} ({acc.avg:.3f})'.format(
                 epoch, idx + 1, len(train_loader), batch_time=batch_time,
-                data_time=data_time, loss=losses, top1=top1))
+                data_time=data_time, loss=losses, acc=acc))
             sys.stdout.flush()
 
     label_gt = np.concatenate(label['gt'], axis=0)
@@ -245,12 +269,12 @@ def validate(val_loader, model, criterion, args):
 
     batch_time = AverageMeter()
     losses = AverageMeter()
-    top1 = AverageMeter()
+    acc = AverageMeter()
     label = {'gt': [], 'pred': []}
 
     with torch.no_grad():
         end = time.time()
-        for idx, (images, targets, _) in enumerate(val_loader):
+        for idx, (images, targets) in enumerate(val_loader):
             images = images.cuda()
             targets = targets.cuda()
             bsz = targets.shape[0]
@@ -261,8 +285,8 @@ def validate(val_loader, model, criterion, args):
 
             # update metric
             losses.update(loss.item(), bsz)
-            acc1 = accuracy(output, targets)
-            top1.update(acc1[0], bsz)
+            acc_batch = accuracy(output, targets)
+            acc.update(acc_batch[0], bsz)
             label['gt'].append(targets.cpu().detach().numpy())
             label['pred'].append(output.cpu().detach().numpy())
 
@@ -274,9 +298,9 @@ def validate(val_loader, model, criterion, args):
                 print('Test: [{0}/{1}]\t'
                       'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                       'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Acc@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+                      'Acc {acc.val:.3f} ({acc.avg:.3f})'.format(
                        idx, len(val_loader), batch_time=batch_time,
-                       loss=losses, top1=top1))
+                       loss=losses, acc=acc))
 
     label_gt = np.concatenate(label['gt'], axis=0)
     label_pred = np.concatenate(label['pred'], axis=0)
@@ -327,8 +351,9 @@ def main():
         # save the last model
         if args.save_model:
             # if epoch % args.save_freq == 0:
+            if val_total_acc > 0.46:
                 save_file = os.path.join(
-                    args.save_folder, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
+                    args.save_folder, 'ckpt_epoch_{epoch}_{total_acc:.4f}.pth'.format(epoch=epoch, total_acc=val_total_acc))
                 save_model(model, optimizer, args, epoch, save_file)
 
     print('best accuracy: {:.4f}'.format(best_total_acc))

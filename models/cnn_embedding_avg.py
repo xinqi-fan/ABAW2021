@@ -5,9 +5,9 @@ from .resnet50_ft_dag import Resnet50_ft_dag
 from .vision_transformer_temporal import TemporalVisionTransformer
 
 
-class CnnVit(nn.Module):
-    def __init__(self, num_patch, embed_dim, output_dim, cnn_ckpt=None, vit_ckpt=None):
-        super(CnnVit, self).__init__()
+class CnnEmbedAvg(nn.Module):
+    def __init__(self, num_patch, embed_dim, output_dim, cnn_ckpt=None):
+        super(CnnEmbedAvg, self).__init__()
 
         self.embed_dim = embed_dim
         self.num_patch = num_patch
@@ -16,11 +16,10 @@ class CnnVit(nn.Module):
         if cnn_ckpt:
             self._load_pretrain_resnet50vgg(cnn_ckpt)
 
-        self.vit = TemporalVisionTransformer(num_patches=self.num_patch, num_classes=output_dim)
-        if vit_ckpt:
-            self._load_pretrain_ViT(vit_ckpt)
+        self.norm = nn.LayerNorm(self.embed_dim)
+        self.avgpool = nn.AvgPool1d(self.embed_dim)
 
-        self.norm = nn.LayerNorm([self.num_patch, self.embed_dim])
+        self.fc = nn.Linear(self.num_patch, output_dim)
 
     def forward(self, x):
         # cnn
@@ -29,12 +28,13 @@ class CnnVit(nn.Module):
 
         x = x.reshape(bs*num_patch, num_c, H, W).contiguous()
         x = self.cnn(x)
+        x = self.norm(x)
         # reshape for transformer input
         z = x.reshape(bs, num_patch, self.embed_dim).contiguous()
-        # layer norm
-        z = self.norm(z)
-        # vit
-        z = self.vit(z)
+        # pool
+        z = torch.squeeze(self.avgpool(z), 2)
+        # classifier
+        z = self.fc(z)
 
         return z
 

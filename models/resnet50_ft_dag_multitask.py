@@ -3,10 +3,10 @@ import torch
 import torch.nn as nn
 
 
-class Resnet50_ft_dag(nn.Module):
+class Resnet50_ft_dag_multitask(nn.Module):
 
-    def __init__(self, output_dim, cnn_ckpt=None):
-        super(Resnet50_ft_dag, self).__init__()
+    def __init__(self, output_dim):
+        super(Resnet50_ft_dag_multitask, self).__init__()
 
         self.meta = {'mean': [131.0912, 103.8827, 91.4953],
                      'std': [1, 1, 1],
@@ -170,7 +170,8 @@ class Resnet50_ft_dag(nn.Module):
         self.conv5_3_relu = nn.ReLU()
         self.pool5_7x7_s1 = nn.AvgPool2d(kernel_size=[7, 7], stride=[1, 1], padding=0)
 
-        self.classifier = nn.Conv2d(2048, output_dim, kernel_size=[1, 1], stride=(1, 1))
+        self.classifier1 = nn.Conv2d(2048, output_dim[0], kernel_size=[1, 1], stride=(1, 1))
+        self.classifier2 = nn.Conv2d(2048, output_dim[1], kernel_size=[1, 1], stride=(1, 1))
 
     def forward(self, data):
         conv1_7x7_s2 = self.conv1_7x7_s2(data)
@@ -347,10 +348,12 @@ class Resnet50_ft_dag(nn.Module):
         conv5_3x = self.conv5_3_relu(conv5_3)
         pool5_7x7_s1 = self.pool5_7x7_s1(conv5_3x)
 
-        classifier_preflatten = self.classifier(pool5_7x7_s1)
-        classifier = classifier_preflatten.view(classifier_preflatten.size(0), -1)
+        classifier_preflatten1 = self.classifier1(pool5_7x7_s1)
+        classifier1 = classifier_preflatten1.view(classifier_preflatten1.size(0), -1)
+        classifier_preflatten2 = self.classifier2(pool5_7x7_s1)
+        classifier2 = classifier_preflatten2.view(classifier_preflatten2.size(0), -1)
 
-        return classifier
+        return [classifier1, classifier2]
 
 
 # def resnet50_ft_dag(weights_path=None, **kwargs):
