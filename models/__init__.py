@@ -44,6 +44,7 @@ from .xception import *
 from .xception_aligned import *
 from .twins import *
 from .resnet50_vgg import *
+from .senet50_vgg import *
 from .cnn_vit import *
 from .cnn_frame_avg import *
 from .cnn_embedding_avg import *

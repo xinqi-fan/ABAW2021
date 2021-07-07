@@ -11,7 +11,7 @@ import torch.backends.cudnn as cudnn
 from torchvision import transforms
 
 from data import AffWild2EXPRDataset
-from models import Resnet50Vgg, CnnVit, CnnFrameAvg, CnnEmbedAvg, CnnSelfAtt, CnnSelfAttSum
+from models import Resnet50Vgg, Senet50Vgg, CnnVit, CnnFrameAvg, CnnEmbedAvg, CnnSelfAtt, CnnSelfAttSum
 from utils import AverageMeter, accuracy, EXPR_metric
 from utils import Logger
 
@@ -54,7 +54,7 @@ def parse_arguments():
 
     # model dataset
     parser.add_argument('--model', type=str, default='Resnet50Vgg',
-                        choices=['Resnet50Vgg', 'CnnVit', 'CnnFrameAvg', 'CnnEmbedAvg', 'CnnSelfAtt', 'CnnSelfAttSum'])
+                        choices=['Resnet50Vgg', 'Senet50Vgg', 'CnnVit', 'CnnFrameAvg', 'CnnEmbedAvg', 'CnnSelfAtt', 'CnnSelfAttSum'])
     parser.add_argument('--dataset', type=str, default='Aff-Wild2',
                         choices=['Aff-Wild2', 'RAF-DB'], help='dataset')
     parser.add_argument('--data_folder', type=str, default='/home/xinqifan2/Data/Facial_Expression/Aff-Wild2/ABAW-2021', help='path to custom dataset')
@@ -150,6 +150,8 @@ def set_model(args):
 
     if args.model == 'Resnet50Vgg':
         model = Resnet50Vgg(output_dim=args.n_cls, ckpt=args.cnn_ckpt)
+    elif args.model == 'Senet50Vgg':
+        model = Senet50Vgg(output_dim=args.n_cls, ckpt=args.cnn_ckpt)
     elif args.model == 'CnnVit':
         model = CnnVit(num_patch=args.num_patch, embed_dim=args.embed_dim, output_dim=args.n_cls, cnn_ckpt=args.cnn_ckpt, vit_ckpt=args.vit_ckpt)
     elif args.model == 'CnnFrameAvg':
