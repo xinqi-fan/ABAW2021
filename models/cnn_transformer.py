@@ -2,19 +2,21 @@ import torch
 import torch.nn as nn
 
 from .resnet50_ft_dag import Resnet50_ft_dag
-from .vision_transformer_temporal import TemporalVisionTransformer
+from .transformer_temporal import TemporalTransformer
 
 
-class CnnVit(nn.Module):
-    def __init__(self, num_patch, embed_dim, output_dim, cnn_ckpt=None, vit_ckpt=None):
-        super(CnnVit, self).__init__()
+class CnnTransformer(nn.Module):
+    def __init__(self, num_patch, embed_dim, output_dim, num_heads, dropout, cnn_ckpt=None):
+        super(CnnTransformer, self).__init__()
 
         self.embed_dim = embed_dim
         self.num_patch = num_patch
+        self.num_heads = num_heads
 
-        self.cnn = Resnet50_ft_dag(output_dim=embed_dim)
+        self.cnn = Resnet50_ft_dag(output_dim=self.embed_dim)
         if cnn_ckpt:
-            self._load_pretrain_cnn(cnn_ckpt)
+            self._load_pretrain_resnet50vgg(cnn_ckpt)
+        self.norm_cnn = nn.LayerNorm(self.embed_dim)
 
         last_layer_name, last_module = list(self.cnn.named_modules())[-1]
         try:
@@ -26,19 +28,22 @@ class CnnVit(nn.Module):
 
         self.proj = nn.Linear(self.cnn.output_feature_dim, self.embed_dim)
 
-        self.vit = TemporalVisionTransformer(num_patches=self.num_patch, num_classes=output_dim, drop_rate=0.5)
-        if vit_ckpt:
-            self._load_pretrain_ViT(vit_ckpt)
+        # transformer
+        self.trans = TemporalTransformer(num_patches=self.num_patch, num_classes=output_dim, drop_rate=0.5)
 
-        self.norm = nn.LayerNorm([self.num_patch, self.embed_dim])
+        # self.norm_sum = nn.BatchNorm1d(self.embed_dim)
+
+        self.fc = nn.Linear(self.embed_dim, output_dim)
+
 
     def forward(self, x):
         # cnn
         bs, num_patch, num_c, H, W = x.shape
         assert num_patch == self.num_patch
         # print(x.shape)
-        x = x.reshape(bs*num_patch, num_c, H, W).contiguous()
-        # print(x.shape)
+
+        x = x.reshape(bs*self.num_patch, num_c, H, W).contiguous()
+
         with torch.no_grad():
             x = self.cnn(x)
         # print(x.shape)
@@ -48,15 +53,21 @@ class CnnVit(nn.Module):
         # print(x.shape)
 
         # reshape for transformer input
-        z = x.reshape(bs, num_patch, self.embed_dim).contiguous()
-        # layer norm
-        z = self.norm(z)
-        # vit
-        z = self.vit(z)
+        x = x.reshape(bs, self.num_patch, self.embed_dim).contiguous()
 
-        return z
+        # only torch 1.9 above support batch_first
+        x = self.trans(x)
 
-    def _load_pretrain_cnn(self, ckpt):
+        # reshape for output
+        # x = x.permute(1, 0, 2)
+        # x = x.reshape(bs, self.num_patch*self.embed_dim)
+        # x = torch.mean(x, dim=1)
+        # classifier
+        x = self.fc(x)
+
+        return x
+
+    def _load_pretrain_resnet50vgg(self, ckpt):
         model_dict = self.cnn.state_dict()
         try:
             checkpoint_org = torch.load(ckpt)['model']
@@ -85,31 +96,24 @@ class CnnVit(nn.Module):
         print('Partial weights freezed')
 
 
-    def _load_pretrain_ViT(self, ckpt):
-        model_dict = self.vit.state_dict()
-        checkpoint = torch.load(ckpt)
-        model_head_dim = model_dict['head.weight'].shape[0]
-        checkpoint_head_dim = checkpoint['head.weight'].shape[0]
-        print(f'model head dim {model_head_dim} | checkpoint_head_dim {checkpoint_head_dim}')
 
-        if model_head_dim != checkpoint_head_dim:
-            print('model head and checkpoint head is different. checkpoint head is discarded.')
-            del checkpoint['head.weight']
-            del checkpoint['head.bias']
+class PositionalEncoding(nn.Module):
 
-        del checkpoint['pos_embed']
-        del checkpoint['patch_embed.proj.bias']
-        del checkpoint['patch_embed.proj.weight']
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
 
-        # since we may remove some layers of Transformer
-        # filter out unnecessary keys
-        new_state_dict = {k: v for k, v in checkpoint.items() if k in model_dict}
-        # overwrite entries in the existing state dict
-        model_dict.update(new_state_dict)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
 
-        self.vit.load_state_dict(checkpoint, strict=False)
-
-        print(f'Transformer pretrained weights is loaded')
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
 
 
 class Identity(nn.Module):

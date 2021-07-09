@@ -5,13 +5,13 @@ import sys
 import argparse
 import time
 import numpy as np
-import pandas as pd
 
 import torch
 import torch.backends.cudnn as cudnn
 from torchvision import transforms
 
 from data import AffWild2EXPRDataset
+from data.dataset_EXPR import AffWild2EXPRSequenceDataset
 from models import Resnet50Vgg, Senet50Vgg, CnnVit, CnnFrameAvg, CnnEmbedAvg, CnnSelfAtt, CnnSelfAttSum
 from models import CnnRnn, CnnTransformer
 from utils import AverageMeter, accuracy, EXPR_metric
@@ -56,19 +56,17 @@ def parse_arguments():
 
     # model dataset
     parser.add_argument('--model', type=str, default='Resnet50Vgg',
-                        choices=['Resnet50Vgg', 'Senet50Vgg', 'CnnVit', 'CnnFrameAvg', 'CnnEmbedAvg', 'CnnSelfAtt', 'CnnSelfAttSum', 'CnnRnn', 'CnnTransformer'])
+                        choices=['Resnet50Vgg', 'Senet50Vgg', 'CnnRnn', 'CnnVit', 'CnnFrameAvg', 'CnnEmbedAvg', 'CnnSelfAtt', 'CnnSelfAttSum', 'CnnTransformer'])
     parser.add_argument('--dataset', type=str, default='Aff-Wild2',
                         choices=['Aff-Wild2', 'RAF-DB'], help='dataset')
-    parser.add_argument('--data_folder', type=str, default='/home/xinqifan2/Data/Facial_Expression/Aff-Wild2/ABAW-2021', help='path to custom dataset')
+    parser.add_argument('--data_folder', type=str, default='/home/xinqifan2/Data/Facial_Expression/Aff-Wild2/ABAW-2021/Annotation/annotations/annotations.pkl', help='path to custom dataset')
     parser.add_argument('--img_relative_folder', type=str, default='Cropped_aligned_image/cropped_aligned', help='path to relative image folder')
     parser.add_argument('--label_relative_folder', type=str, default='Annotation/annotations', help='path to relative label folder')
     parser.add_argument('--task', type=str, default='EXPR')
     parser.add_argument('--data_mode', type=str, default='static',
-                        choices=['static', 'sequence_naive', 'sequence_naive_last_frame','sequence_video_middle', 'sequence_video_middle_repeat', 'sequence_video_non_middle'])
+                        choices=['static', 'sequence_naive', 'sequence_naive_last_frame', 'sequence_video_middle', 'sequence_video_middle_repeat', 'sequence_video_non_middle', 'sequence_by_sequence'])
 
     # other setting
-    parser.add_argument('--ckpt', type=str, default='save/Aff-Wild2_models/Aff-Wild2_static_EXPR_CnnRnn_lr_0.0005_bsz_6/ckpt_epoch_1_0.4689.pth',
-                        help='path to pre-trained model')
     parser.add_argument('--cnn_ckpt', type=str, default='weights/resnet50_ft_dag.pth',
                         help='path to pre-trained model')
     parser.add_argument('--vit_ckpt', type=str, default='weights/jx_vit_base_p16_224-80ecf9dd.pth',
@@ -80,7 +78,6 @@ def parse_arguments():
     parser.add_argument('--save_model', action='store_true',
                         help='save model')
     parser.add_argument('--hpc', action='store_true', help='whether train on hpc')
-    parser.add_argument('--test_only', action='store_true', help='disable undesired actions in test')
 
     args = parser.parse_args()
 
@@ -132,8 +129,12 @@ def set_loader(args):
     ])
 
     if args.dataset == 'Aff-Wild2':
-        train_dataset = AffWild2EXPRDataset(args.data_folder, args.img_relative_folder, args.label_relative_folder, data_mode=args.data_mode, phase='train', transform=train_transform, sequence_len=args.num_patch)
-        val_dataset = AffWild2EXPRDataset(args.data_folder, args.img_relative_folder, args.label_relative_folder, data_mode=args.data_mode, phase='validation', transform=val_transform, sequence_len=args.num_patch)
+        # train_dataset = AffWild2EXPRDataset(args.data_folder, args.img_relative_folder, args.label_relative_folder, data_mode=args.data_mode, phase='train', transform=train_transform, sequence_len=args.num_patch)
+        # val_dataset = AffWild2EXPRDataset(args.data_folder, args.img_relative_folder, args.label_relative_folder, data_mode=args.data_mode, phase='validation', transform=val_transform, sequence_len=args.num_patch)
+        train_dataset = AffWild2EXPRSequenceDataset(label_path=args.data_folder, seq_len=args.num_patch, train_mode='Train',
+                                                    transform=train_transform)
+        val_dataset = AffWild2EXPRSequenceDataset(label_path=args.data_folder, seq_len=args.num_patch, train_mode='Validation',
+                                                    transform=val_transform)
         print('Train set size:', train_dataset.__len__())
         print('Validation set size:', val_dataset.__len__())
         # train_sampler = weighted_sampler_generator(data_txt_dir, args.dataset)
@@ -169,14 +170,12 @@ def set_model(args):
         model = CnnSelfAttSum(num_patch=args.num_patch, embed_dim=args.embed_dim, output_dim=args.n_cls, num_heads=4, dropout=0.2, cnn_ckpt=args.cnn_ckpt)
     elif args.model == 'CnnRnn':
         model = CnnRnn(num_patch=args.num_patch, embed_dim=args.embed_dim, output_dim=args.n_cls, num_heads=4,
-                              dropout=0.2, cnn_ckpt=args.cnn_ckpt)
+                       dropout=0.2, cnn_ckpt=args.cnn_ckpt)
     elif args.model == 'CnnTransformer':
         model = CnnTransformer(num_patch=args.num_patch, embed_dim=args.embed_dim, output_dim=args.n_cls, num_heads=4,
                               dropout=0.5, cnn_ckpt=args.cnn_ckpt)
     else:
         raise ValueError('model not supported: {}'.format(args.model))
-
-    load_pretrain_cnn(model, args.ckpt)
 
     print(model)
     # check requires grad
@@ -194,25 +193,6 @@ def set_model(args):
 
     return model, criterion
 
-def load_pretrain_cnn(model, ckpt):
-    model_dict = model.state_dict()
-    try:
-        checkpoint_org = torch.load(ckpt)['model']
-    except:
-        checkpoint_org = torch.load(ckpt)
-
-    checkpoint = {}
-    for i, k in enumerate(checkpoint_org.keys()):
-        new_k = k.replace('module.', '')
-        checkpoint[new_k] = checkpoint_org[k]
-
-    # classifier_name = 'classifier'
-    # del checkpoint[classifier_name + '.weight']
-    # del checkpoint[classifier_name + '.bias']
-    # print('checkpoint head is discarded.')
-
-    model.load_state_dict(checkpoint)
-    print(f'pretrained weights is loaded')
 
 def set_optimizer(args, model):
 
@@ -257,16 +237,24 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     label = {'gt': [], 'pred': []}
 
     end = time.time()
-    for idx, (images, targets, images_path) in enumerate(train_loader):
+    for idx, (images, targets) in enumerate(train_loader):
         data_time.update(time.time() - end)
+        # print(images.shape)
+        B, S, C, H, W = images.shape
+        # print(targets.shape)
 
         images = images.cuda()
         targets = targets.cuda()
-        bsz = targets.shape[0]
+        bsz = B * S
 
         # model
         output = model(images)
 
+        # loss
+        output = output.reshape(B*S, -1).contiguous()
+        # print(output.shape)
+        targets = targets.reshape(B*S, -1).contiguous().squeeze(-1)
+        # print(targets.shape)
         loss = criterion(output, targets)
 
         # update metric
@@ -309,17 +297,23 @@ def validate(val_loader, model, criterion, args):
     batch_time = AverageMeter()
     losses = AverageMeter()
     acc = AverageMeter()
-    label = {'img_path': [], 'gt': [], 'pred': []}
+    label = {'gt': [], 'pred': []}
 
     with torch.no_grad():
         end = time.time()
-        for idx, (images, targets, images_path) in enumerate(val_loader):
+        for idx, (images, targets) in enumerate(val_loader):
+            B, S, C, H, W = images.shape
+
             images = images.cuda()
             targets = targets.cuda()
-            bsz = targets.shape[0]
+            bsz = B * S
 
             # model
             output = model(images)
+
+            # loss
+            output = output.reshape(B * S, -1).contiguous()
+            targets = targets.reshape(B * S, -1).contiguous().squeeze(-1)
             loss = criterion(output, targets)
 
             # update metric
@@ -328,7 +322,6 @@ def validate(val_loader, model, criterion, args):
             acc.update(acc_batch[0], bsz)
             label['gt'].append(targets.cpu().detach().numpy())
             label['pred'].append(output.cpu().detach().numpy())
-            label['img_path'].append(images_path)
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -344,15 +337,7 @@ def validate(val_loader, model, criterion, args):
 
     label_gt = np.concatenate(label['gt'], axis=0)
     label_pred = np.concatenate(label['pred'], axis=0)
-    label_img_path = np.concatenate(label['img_path'], axis=0)
     f1, acc, total_acc = EXPR_metric(label_pred, label_gt)
-
-    label_frame = np.concatenate((np.expand_dims(label_img_path, axis=1), np.expand_dims(label_gt, axis=1),  label_pred), axis=1)
-    label_frame = pd.DataFrame(label_frame)
-    save_file_path = os.path.join(
-        args.save_folder, f'{args.model_name}_validation_result.cvs')
-    label_frame.to_csv(save_file_path, index=False)
-    print(f'label saved to {save_file_path}')
 
     return losses.avg, f1, acc, total_acc
 
@@ -378,11 +363,11 @@ def main():
     for epoch in range(1, args.epochs + 1):
 
         # train for one epoch
-        # time1 = time.time()
-        # loss, train_f1, train_acc, train_total_acc = train(train_loader, model, criterion, optimizer, epoch, args)
-        # time2 = time.time()
-        # print('Train epoch {}, total time {:.2f}, F1:{:.4f}, accuracy:{:.4f}, total accuracy:{:.4f}'.format(
-        #     epoch, time2 - time1, train_f1, train_acc, train_total_acc))
+        time1 = time.time()
+        loss, train_f1, train_acc, train_total_acc = train(train_loader, model, criterion, optimizer, epoch, args)
+        time2 = time.time()
+        print('Train epoch {}, total time {:.2f}, F1:{:.4f}, accuracy:{:.4f}, total accuracy:{:.4f}'.format(
+            epoch, time2 - time1, train_f1, train_acc, train_total_acc))
 
         # eval for one epoch
         time1 = time.time()

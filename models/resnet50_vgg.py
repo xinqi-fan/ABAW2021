@@ -20,15 +20,37 @@ class Resnet50Vgg(nn.Module):
         return x
 
     def _load_pretrain_resnet50vgg(self, ckpt):
-        checkpoint = torch.load(ckpt)
+        model_dict = self.cnn.state_dict()
+        try:
+            checkpoint_org = torch.load(ckpt)['model']
+        except:
+            checkpoint_org = torch.load(ckpt)
 
-        classifier_name = 'classifier'
-        del checkpoint[classifier_name + '.weight']
-        del checkpoint[classifier_name + '.bias']
-        print('checkpoint head is discarded.')
+        checkpoint = {}
+        for i, k in enumerate(checkpoint_org.keys()):
+            new_k = k[11:] # remove module.cnn.
+            checkpoint[new_k] = checkpoint_org[k]
+
+        # classifier_name = 'classifier'
+        # del checkpoint[classifier_name + '.weight']
+        # del checkpoint[classifier_name + '.bias']
+        # print('checkpoint head is discarded.')
+
+        print(model_dict.keys())
+        print(checkpoint.keys())
 
         self.cnn.load_state_dict(checkpoint, strict=False)
         print(f'CNN pretrained weights is loaded')
+
+        # checkpoint = torch.load(ckpt)
+        #
+        # classifier_name = 'classifier'
+        # del checkpoint[classifier_name + '.weight']
+        # del checkpoint[classifier_name + '.bias']
+        # print('checkpoint head is discarded.')
+        #
+        # self.cnn.load_state_dict(checkpoint, strict=False)
+        # print(f'CNN pretrained weights is loaded')
 
         # freeze weights
         # for p in self.cnn.parameters():
